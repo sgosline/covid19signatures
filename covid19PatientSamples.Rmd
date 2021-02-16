@@ -1,0 +1,155 @@
+---
+title: "Covid19 Patient Analysis"
+author: "Sara Gosline"
+date: "01/04/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(reticulate)
+library(leapr)
+library(umap)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+```
+
+## Covid 19 Patient Cohorot
+
+This analysis measures bulk proteomics data from COVID19 patient samples collected from a ventilator. 
+
+
+```{r getDatasets,echo=FALSE,warning=FALSE}
+##get data from synapse, summarize patient data
+synapse=reticulate::import('synapseclient')
+syn = synapse$login()
+
+tab = syn$tableQuery("select * from syn23561386")$asDataFrame()
+
+#patient data
+
+```
+
+## Format proteomics data
+
+Now we can tidy up the proteomics data and assemble in a meaningful manner
+
+```{r protData,echo=FALSE}
+pmat<-read.csv(syn$get('syn23569377')$path,check.names=FALSE)
+
+##this is the full matrix for now
+pdat<-pmat%>%
+  pivot_longer(cols=c(2:ncol(pmat)),names_to='DatasetName',values_to='LogRatio')%>%
+  left_join(tab)
+
+newmat<-pdat%>%select(Protein,DatasetName,LogRatio)%>%
+  replace_na(list(LogRatio=0.0))%>%
+  pivot_wider(names_from=Protein,values_from=LogRatio)%>%
+  tibble::column_to_rownames('DatasetName')
+
+#create UMAP plot of proteomics data
+res<-umap(as.matrix(newmat))$layout
+colnames(res)<-c('d1','d2')
+res<-res%>%
+  as.data.frame()%>%
+  tibble::rownames_to_column('DatasetName')%>%
+  left_join(dplyr::select(tab,'DatasetName','Phenotype','Sex','Blood_type'))
+
+p1<-ggplot(res,aes(x=d1,y=d2,col=Phenotype,label=DatasetName))+geom_point()
+p2<-p1+geom_text()
+#p3<-cowplot::plot_grid(plotlist=list(p1,p2))
+#p3
+p1
+```
+
+We can now see the overall layout of the patient data. Healthy sputum is clearly distinct, but the clusters between COVID and non-COVID are a bit intermingled. 
+
+## Compute differentially expressed proteins
+
+We now want to see what proteins are differentially expressed between two categories, and compute the pathways enriched in those.
+
+
+```{r pathwayEnrichment, warning=FALSE, echo=FALSE}
+source('proteinValues.R')
+
+patVars<-res%>%
+  dplyr::select(Patient=DatasetName,Phenotype,Sex)%>%
+  distinct()%>%
+  subset(Phenotype!='Control')%>%
+  replace_na(list(Phenotype='unknown',Sex=''))%>%
+  mutate(Sex=unlist(Sex))
+rownames(patVars)<-c()
+
+protsVals<-limmaTwoFactorDEAnalysis(t(newmat),
+                                    subset(patVars,Phenotype%in%c('no infection',
+                                                                  'non-covid'))$Patient,                                    subset(patVars,Phenotype=='Covid')$Patient)%>%
+  separate(col='featureID',into=c('sp','uniprotswissprot','gn'),sep="[|]",remove=FALSE)
+
+protsVals%>%arrange(P.Value)%>%head()
+
+library(pheatmap)
+pheatmap(newmat[,rownames(protsVals)[1:10]],
+         annotation_row =tibble::column_to_rownames(patVars,'Patient'))
+
+```
+
+## GSEA Enrichment
+
+There are only 2 proteins differentially expressed, but maybe we can do do some pathway enrichment
+```{r gsea, warning=FALSE, echo=FALSE}
+library(biomaRt)
+
+m<-useMart('ensembl',dataset='hsapiens_gene_ensembl')
+with.mapping<-biomaRt::getBM(mart=m,attributes=c('uniprotswissprot','hgnc_symbol'),
+                        filters='uniprotswissprot',values=protsVals$uniprotswissprot)%>%
+  right_join(protsVals)%>%
+  arrange(desc(logFC))
+
+genes.with.values<-with.mapping%>%
+  dplyr::select(Gene='hgnc_symbol',value='logFC')
+
+source("bagOfGenesEnrichment.R")
+res<-plotOldGSEA(genes.with.values, prefix='covidVsOther')
+head(res)
+
+subset(res,p.adjust<.01)%>%
+  dplyr::select(Description,NES,p.adjust)%>%
+  knitr::kable()
+ 
+```
+
+
+## Comparison with viral interaction targets
+
+Now we can pull in data from the human protein-COVID19 interaction network. 
+
+
+## Interactors
+
+Let's get the covid interactions
+```{r interactors}
+covid.prots<-readxl::read_xlsx(syn$get('syn23585049')$path,sheet='SARS-CoV-2_HighConfidence')
+
+diffex.targs<-protsVals%>%rename(Preys='uniprotswissprot')%>%inner_join(covid.prots)
+
+prot.annote<-diffex.targs%>%select(featureID,Bait)%>%distinct()%>%
+  tibble::column_to_rownames('featureID')
+
+pheatmap(newmat[,unique(diffex.targs$featureID)],
+         annotation_row =tibble::column_to_rownames(patVars,'Patient'),
+         annotation_col=prot.annote,labels_col=rep('',ncol(newmat)))
+
+
+pheatmap(newmat[,unique(diffex.targs$featureID)],
+         annotation_row =tibble::column_to_rownames(patVars,'Patient'),
+         annotation_col=prot.annote,labels_col=rep('',ncol(newmat)),cellwidth=10,cellheight=10,filename='covidInteractorExpression.pdf')
+
+##what is the expression of these? 
+ggplot(diffex.targs,aes(y=logFC,fill=Bait,col=Bait,alpha=0.5,x=Bait))+geom_jitter()
+
+
+
+```
+
+
